@@ -633,6 +633,7 @@
       - 如果达到设置的循环步数，退出循环
 
   - 每轮训练结束：验证、`rollout`
+
                 train_loss = np.mean(train_losses)
                 step_log['train_loss'] = train_loss
 
@@ -670,3 +671,84 @@
     - 使用`policy`变量指向`model`，将其设置为评估模式
     - 运行`rollout`并记录
     - 运行验证，将验证的平均损失记录
+    - [ ] 待做：解读`self.model.compute_loss`（计算损失）方法（在[`diffusion_unet_hybrid_image_policy`](diffusion_policy/diffusion_policy/policy/diffusion_unet_hybrid_image_policy.py)文件中定义）
+
+  - 采样与动作误差评估
+
+                # run diffusion sampling on a training batch
+                if (self.epoch % cfg.training.sample_every) == 0:
+                    with torch.no_grad():
+                        # sample trajectory from training set, and evaluate difference
+                        batch = dict_apply(train_sampling_batch, lambda x: x.to(device, non_blocking=True))
+                        obs_dict = batch['obs']
+                        gt_action = batch['action']
+
+                        result = policy.predict_action(obs_dict)
+                        pred_action = result['action_pred']
+                        mse = torch.nn.functional.mse_loss(pred_action, gt_action)
+                        step_log['train_action_mse_error'] = mse.item()
+                        del batch
+                        del obs_dict
+                        del gt_action
+                        del result
+                        del pred_action
+                        del mse
+
+    - 对训练集批次进行扩散采样，并且计算预测动作和真实动作的均方误差（`MSE`）
+    - [ ] 待做：解读`policy.predict_action`（预测动作）方法（在[`diffusion_unet_hybrid_image_policy`](diffusion_policy/diffusion_policy/policy/diffusion_unet_hybrid_image_policy.py)文件中定义）
+
+  - 保存检查点
+
+                if (self.epoch % cfg.training.checkpoint_every) == 0:
+
+                    if cfg.checkpoint.save_last_ckpt:
+                        self.save_checkpoint()
+                    if cfg.checkpoint.save_last_snapshot:
+                        self.save_snapshot()
+
+                    # sanitize metric names
+                    metric_dict = dict()
+                    for key, value in step_log.items():
+                        new_key = key.replace('/', '_')
+                        metric_dict[new_key] = value
+                    
+                    # We can't copy the last checkpoint here
+                    # since save_checkpoint uses threads.
+                    # therefore at this point the file might have been empty!
+                    topk_ckpt_path = topk_manager.get_ckpt_path(metric_dict)
+
+                    if topk_ckpt_path is not None:
+                        self.save_checkpoint(path=topk_ckpt_path)
+
+    - 调用父类的保存检查点和快照方法
+      - *注意`save_point`使用了多线程，可能会导致保存检查点的操作还未完成时，代码已经继续往下执行，由于保存检查点的操作可能仍在进行中，因此检查点文件（模型状态、训练状态等）的内容可能尚未完全写入到磁盘，如果此时试图立即复制或使用最新的检查点文件，文件可能会处于不完整或空白状态*
+
+  - 结束当前周期并更新日志、状态
+
+        policy.train()
+        wandb_run.log(step_log, step=self.global_step)
+        json_logger.log(step_log)
+        self.global_step += 1
+        self.epoch += 1
+
+### `@hydra.main`装饰器
+
+    @hydra.main(
+    version_base=None,
+    config_path=str(pathlib.Path(__file__).parent.parent.joinpath("config")), 
+    config_name=pathlib.Path(__file__).stem)
+
+- `@hydra.main`是`Hydra`提供的一个装饰器，用于将函数`main`转换为`Hydra`应用程序。
+- `version_base=None`表示不使用特定的版本控制。
+- `config_path`指定配置文件的位置，使用`pathlib`动态构造路径，指向当前脚本的父级目录中的 config 文件夹。
+- `config_name`设置为当前脚本的名称（去掉扩展名），即根据脚本的命名来确定要加载的配置文件。
+
+### `main`函数定义
+
+    def main(cfg):
+        workspace = TrainDiffusionUnetHybridWorkspace(cfg)
+        workspace.run()
+
+- 参数：
+  - `cfg`:由`Hydra`加载的配置对象
+- 在函数内部，创建一个`TrainDiffusionUnetHybridWorkspace`的实例，传入加载的配置 `cfg`
