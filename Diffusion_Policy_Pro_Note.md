@@ -752,3 +752,313 @@
 - 参数：
   - `cfg`:由`Hydra`加载的配置对象
 - 在函数内部，创建一个`TrainDiffusionUnetHybridWorkspace`的实例，传入加载的配置 `cfg`
+
+***这一部分中最重要的是初始化过程中的`self.model: DiffusionUnetHybridImagePolicy = hydra.utils.instantiate(cfg.policy)`，此行决定了模型的性质。因此下一步将研究`DiffusionUnetHybridImagePolicy`类，由于继承关系是`DiffusionUnetHybridImagePolicy`$\rightarrow$`BaseImagePolicy`$\rightarrow$`ModuleAttrMixin`$\rightarrow$`torch.nn.Module`，下文将先从`ModuleAttrixin`开始***
+
+## module attr mixin
+
+### `ModuleAttrMixin`类
+
+**继承自`torch.nn`的派生类，为了方便获取模型中参数的设备类型 `device` 和数据类型 `dtype`，使得在模型的开发和调试中能够更快速地访问这些信息**
+
+- 初始化方法
+
+            def __init__(self):
+                super().__init__()
+                self._dummy_variable = nn.Parameter()
+
+  - 创建了一个空的`nn.Parameter`变量`_dummy_variable`，确保该模块至少有一个参数，以便在后续的`device`和`dtype`属性的实现中使用`parameters`函数
+    - 为什么需要`self._dummy_variable`：在某些模型或自定义模块中，可能没有实际的`nn.Parameter`。如果没有参数，`self.parameters()`将返回一个空的迭代器。在这种情况下，`device`和`dtype`属性的`next(iter(self.parameters()))`会导致`StopIteration`异常。因此，通过定义一个虚拟参数来避免这个问题。
+
+- 获取设备属性
+
+            @property
+            def device(self):
+                return next(iter(self.parameters())).device
+
+  - `@property`装饰器将`device`定义为一个只读属性，允许直接通过`model.device`访问
+  - `next(iter(self.parameters())).device`的含义是从模型的参数迭代器`self.parameters()`中获取第一个参数，并访问其`device`属性
+
+- 获取数据类型属性
+
+            @property
+            def dtype(self):
+                return next(iter(self.parameters())).dtype
+
+  - `@property`装饰器将`dtype`定义为一个只读属性，允许直接通过`model.dtype`访问
+  - `next(iter(self.parameters())).dtype`的含义是从模型的参数迭代器`self.parameters()`中获取第一个参数，并访问其`dtype`属性
+
+## base image policy
+
+### BaseImagePolicy
+
+**继承自`ModuleAttrMixin`的抽象基类，通常用于定义一系列方法和接口供具体的策略模型实现（例如卷积网络、变分自编码器等图像策略模型）**
+
+- `predict_action`方法
+
+        def predict_action(self, obs_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+            """
+            obs_dict:
+                str: B,To,*
+            return: B,Ta,Da
+            """
+            raise NotImplementedError()
+
+  - 该方法设计目的是为模型的策略推理接口提供一个标准定义
+  - 参数解释：
+    - `obs_dict`：输入字典`Dict[str,torch.Tensor]`，其中每个键`str`表示一种观测（图像、状态），每个值`torch.tensor`是一个张量，表示输入数据
+      - 形状约定：注释中指出每个张量的形状格式为`(B,To,*)`
+        - `B`：批次大小
+        - `To`：观测时间维度
+        - `*`：任意形状的其余维度
+  - 返回值：
+    - 返回一个字典，表示预测的动作`action`
+      - 形状约定：
+        - `B`：批次大小
+        - `Ta`：动作执行时间维度
+        - `Da`：动作维度
+  - `NotImplementedError`**异常**：该方法目前没有实际实现，子类（例如实际的图像策略模型）必须实现该接口，定义其具体的动作预测逻辑
+
+- `reset`方法
+
+        def reset(self):
+            pass
+
+  - `reset()`方法用于重置策略模型的内部状态
+  - 在某些强化学习或序列模型中，策略模型可能是有状态的`（stateful）`，这意味着它们在不同时间步之间保留内部状态`（例如 RNN、LSTM）`。在这种情况下，每次开始新的一轮推理时（例如新一轮游戏或新一组序列数据）需要调用`reset()`以清除之前的状态
+  -当前实现是一个空函数`（pass）`，表示默认情况下策略模型是无状态的`（stateless）`。子类可以根据具体需求重写该方法，重置模型内部状态（如隐藏层状态、注意力权重等）。
+
+- `set_normalizer`方法
+
+        def set_normalizer(self, normalizer: LinearNormalizer):
+            raise NotImplementedError()
+
+  - 该方法设计为一个接口，用于设置模型的输入/输出正则化器`Normalizer`
+  - 参数：
+    - `normalizer`：类型为`LinearNormalizer`，表示一个线性正则化对象
+    - `LinearNormalizer`的作用通常是对输入的观测值进行标准化`normalization`或去标准化`denormalization`，例如将输入图像数据标准化到`[0, 1]`范围内，或者对动作值进行均值和方差的调整。
+
+- `NotImplementedError`**异常**：该方法目前没有实际实现，子类必须实现该接口以定义如何应用正则化器到模型中。通常，模型需要正则化器来保持输入数据的标准一致性，从而提升模型训练的稳定性和推理的准确性。
+
+- `BaseImagePolicy`的设计目的是为所有基于图像的策略模型提供一个统一的接口和基础结构。在实际应用中，不同类型的图像策略模型（如卷积神经网络、基于注意力的模型等）可能有不同的架构，但它们都应具备以下能力：
+  - 动作预测`predict_action`：能够从给定的观测中预测相应的动作。
+  - 状态重置`reset`：在需要时，能够重置其内部状态（如有）。
+  - 正则化`set_normalizer`：能够使用标准化器对输入和输出数据进行处理。
+
+## Diffusion Unet hybrid image policy
+
+### DiffusionUnetHybridImagePolicy
+
+**该类使用扩散模型（diffusion models）来处理条件`conditional`图像输入，并结合*行为克隆`Behavior Cloning`*和*图像特征编码器*，以预测机器人在多步操作序列中的动作。这个模型框架综合了`robomimic`框架的图像处理模块和`diffusers`扩散模型，设计用于解决多步序列的动作推理任务。**
+
+- 类的初始化构造与组建
+  - 构造函数参数：
+
+        def __init__(self, 
+                    shape_meta: dict,
+                    noise_scheduler: DDPMScheduler,
+                    horizon, 
+                    n_action_steps, 
+                    n_obs_steps,
+                    num_inference_steps=None,
+                    obs_as_global_cond=True,
+                    crop_shape=(76, 76),
+                    diffusion_step_embed_dim=256,
+                    down_dims=(256,512,1024),
+                    kernel_size=5,
+                    n_groups=8,
+                    cond_predict_scale=True,
+                    obs_encoder_group_norm=False,
+                    eval_fixed_crop=False,
+                    **kwargs):
+
+    - `shape_meta`：表示输入数据（观察值和动作）的形状元数据，用于指定动作和观察数据的维度结构
+    - `noise_scheduler`：一个用于时间步长调度的扩散噪声调度器对象`DDPMScheduler`，用于模拟扩散过程
+    - `horizon`：表示模型能够预测的最长动作序列的长度
+    - `n_action_steps`：表示一次推理中需要预测的动作步数
+    - `n_obs_steps`：表示每次输入推理中包含的观测步数
+    - `num_inference_steps`：用于控制扩散模型中推理过程的时间步数
+    - `obs_as_global_cond`：布尔类型参数，决定是否将观测特征作为全局条件输入，默认开启
+    - `crop_shape`：元组，定义了处理图像时的裁减尺寸
+    - `diffusion_step_embed_dim`：指定扩散步骤嵌入的维度
+    - `down_dims`：定义了处理数据时降维尺寸
+    - `kernels_size`：定义了卷及核的大小
+    - `n_groups`：定义了分组卷积的组数
+    - `cond_predict_scale`：指示是否对条件预测进行缩放
+    - `obs_encoder_group_norm`：指示是否在观察编码器中使用组归一化
+    - `eval_fixed_crop`：指示在评估时是否使用固定的裁减
+    - `**kwargs`：一个字典，包含其他任意数量的关键字参数，用于提供额外的配置选项
+
+- 初始化观测处理器
+
+        # parse shape_meta
+        action_shape = shape_meta['action']['shape']
+        obs_shape_meta = shape_meta['obs']
+        obs_config = {'low_dim': [], 'rgb': [], 'depth': [], 'scan': []}
+
+        # process obs shape meta to update obs_config
+        for key, attr in obs_shape_meta.items():
+            shape = attr['shape']
+            type = attr.get('type', 'low_dim')
+            obs_key_shapes[key] = list(shape)
+            if type == 'rgb':
+                obs_config['rgb'].append(key)
+            elif type == 'low_dim':
+                obs_config['low_dim'].append(key)
+
+  - 解析`shape_meta`中提供的动作和观测数据的元数据，并且基于类型(`low_dim`,`rgb`等)将观测数据分类
+  - 初始化`obs_config`，用于指定`robomimic`中的观测模式，以匹配输入数据的格式
+    - *`dict.get()`是`python`中字典获取键对应的值，如果键不存在，则用第二个参数替代值返回*
+
+- 配置`robomimic`中的观测数据模块
+
+        config = get_robomimic_config(
+            algo_name='bc_rnn',
+            hdf5_type='image',
+            task_name='square',
+            dataset_type='ph')
+
+        with config.unlocked():
+            # set config with shape_meta
+            config.observation.modalities.obs = obs_config
+
+            if crop_shape is None:
+                for key, modality in config.observation.encoder.items():
+                    if modality.obs_randomizer_class == 'CropRandomizer':
+                        modality['obs_randomizer_class'] = None
+            else:
+                # set random crop parameter
+                ch, cw = crop_shape
+                for key, modality in config.observation.encoder.items():
+                    if modality.obs_randomizer_class == 'CropRandomizer':
+                        modality.obs_randomizer_kwargs.crop_height = ch
+                        modality.obs_randomizer_kwargs.crop_width = cw
+
+        ObsUtils.initialize_obs_utils_with_config(config)
+
+  - `get_robomimic_config`：获取一个基于`robomimic`的行为克隆模型配置 (`bc_rnn`)，该配置会根据`obs_config`来调整模型的输入模式（如使用图像观测或低维观测）
+  - **设置图像裁剪参数**：根据`crop_shape`是否为空，决定是否应用`CropRandomizer`模块。`CropRandomizer`模块用于在训练时对图像进行随机裁剪，以增强数据的多样性。这样可以帮助模型更好地处理不同视角下的图像输入
+  - 根据`config`配置的观测模式（如`rgb`图像`low_dim`低维观测数据）来初始化`ObsUtils`的内部变量，使得观测数据能够被正确地预处理和解析
+
+- 创建`robomimic`策略模型并提取观测编码器
+
+        policy: PolicyAlgo = algo_factory(
+                algo_name=config.algo_name,
+                config=config,
+                obs_key_shapes=obs_key_shapes,
+                ac_dim=action_dim,
+                device='cpu',
+            )
+        obs_encoder = policy.nets['policy'].nets['encoder'].nets['obs']
+
+  - 使用`algo_factory`根据`robomimic`配置创建策略模型，并从中提取观测数据编码器 (obs_encoder)
+  - `obs_encoder`是一个神经网络模块，负责将原始观测数据（图像或低维状态）编码成高维特征，用于进一步的策略预测
+
+- 替换`obs_encoder`中的`BatchNorm`层（可选）
+
+        if obs_encoder_group_norm:
+            # replace batch norm with group norm
+            replace_submodules(
+                root_module=obs_encoder,
+                predicate=lambda x: isinstance(x, nn.BatchNorm2d),
+                func=lambda x: nn.GroupNorm(
+                    num_groups=x.num_features//16, 
+                    num_channels=x.num_features)
+            )
+
+  - 这段代码根据用户传入的参数`obs_encoder_group_norm`，决定是否将`BatchNorm`层替换为`GroupNorm`。这种替换在小批次训练时尤其有用，可以减少 BatchNorm 的噪声影响
+
+- 替换`obs_encoder`模块中的所有`CropRandomizer`子模块（可选）
+
+        if eval_fixed_crop:
+            replace_submodules(
+                root_module=obs_encoder,
+                predicate=lambda x: isinstance(x, rmbn.CropRandomizer),
+                func=lambda x: dmvc.CropRandomizer(
+                    input_shape=x.input_shape,
+                    crop_height=x.crop_height,
+                    crop_width=x.crop_width,
+                    num_crops=x.num_crops,
+                    pos_enc=x.pos_enc
+                )
+            )
+  - 当`eval_fixed_crop`为`True`时，遍历`obs_encoder`中的所有子模块，将所有类型为`rmbn.CropRandomizer`的实例替换为`dmvc.CropRandomizer`的新实例
+  - 这个替换通常是为了在评估阶段使用不同的裁剪逻辑或参数，确保模型在评估时的稳定性和一致性
+
+- 初始化扩散模型（`diffusion_model`）
+
+        # create diffusion model
+        obs_feature_dim = obs_encoder.output_shape()[0]
+        input_dim = action_dim + obs_feature_dim
+        global_cond_dim = None
+        if obs_as_global_cond:
+            input_dim = action_dim
+            global_cond_dim = obs_feature_dim * n_obs_steps
+
+        model = ConditionalUnet1D(
+            input_dim=input_dim,
+            local_cond_dim=None,
+            global_cond_dim=global_cond_dim,
+            diffusion_step_embed_dim=diffusion_step_embed_dim,
+            down_dims=down_dims,
+            kernel_size=kernel_size,
+            n_groups=n_groups,
+            cond_predict_scale=cond_predict_scale
+        )
+
+  - `obs_feature_dim = obs_encoder.output_shape()[0]`，获取观察编码器`(obs_encoder)`输出的特征维度`（obs_feature_dim）`，通常这是在处理输入观测数据后生成的特征数量。
+  - `input_dim = action_dim + obs_feature_dim`，`input_dim`定义了输入到扩散模型中的维度。在这里，输入维度是由动作维度`（action_dim）`和观察特征维度`（obs_feature_dim）`的和构成的。
+  - `global_cond_dim = None`，初始化`global_cond_dim`为`None`，这是后续用于条件输入的维度
+  - 判断是否将观察作为全局条件进行输入
+    - 若是，则只将动作维度作为输入维度，`input_dim`设置为`action_dim`，`global_cond_dim`设为观察特征维度乘以观察步数`obs_feature_dim*n_obs_steps`，这表示全局条件的维度
+  - `ConditionalUnet1D`：基于条件`UNet`结构的扩散模型，它接收观测特征作为条件输入，并通过时间步长嵌入（`diffusion_step_embed_dim`）和`UNet`网络层进行条件扩散和动作预测
+    - 模型参数：
+      - `input_dim`: 输入的特征维度
+      - `local_cond_dim=None`: 局部条件的维度，这里设为`None`，可能表示没有使用局部条件
+      - `global_cond_dim`: 全局条件的维度
+      - `diffusion_step_embed_dim`: 扩散步嵌入的维度
+      - `down_dims`: 网络中每个下采样层的维度列表
+      - `kernel_size`: 卷积核的大小
+      - `n_groups`: 分组归一化的组数
+      - `cond_predict_scale`: 条件预测缩放参数
+
+- 初始化其他组件
+
+        self.obs_encoder = obs_encoder
+        self.model = model
+        self.noise_scheduler = noise_scheduler
+        self.mask_generator = LowdimMaskGenerator(
+            action_dim=action_dim,
+            obs_dim=0 if obs_as_global_cond else obs_feature_dim,
+            max_n_obs_steps=n_obs_steps,
+            fix_obs_steps=True,
+            action_visible=False
+        )
+
+  - `self.obs_encoder = obs_encoder`: 保存观察编码器
+  - `self.model = model`: 保存创建的扩散模型
+  - `self.noise_scheduler = noise_scheduler`: 保存噪声调度器
+  - `self.mask_generator = LowdimMaskGenerator(...)`: 初始化一个低维掩码生成器，参数包括动作维度、观察维度、最大观察步数等。这个生成器用于生成掩码，控制模型在训练时应该关注哪些输入。
+    - `LowdimMaskGenerator`类的主要功能是根据输入的参数生成一个掩码（mask），用于控制在序列模型中哪些特征（观察或动作）在某个时间步上被看见或隐藏。这个类的典型应用场景是扩散模型或其他序列生成模型的训练中，用来限制模型在不同时间步上能访问的输入特征，尤其是在涉及行为建模或时序数据处理时
+
+- 正则化器和其他参数
+
+        self.normalizer = LinearNormalizer()
+        self.horizon = horizon
+        self.obs_feature_dim = obs_feature_dim
+        self.action_dim = action_dim
+        self.n_action_steps = n_action_steps
+        self.n_obs_steps = n_obs_steps
+        self.obs_as_global_cond = obs_as_global_cond
+        self.kwargs = kwargs
+
+  - `self.normalizer = LinearNormalizer()`: 初始化一个线性归一化器，用于对输入进行归一化处理
+  - 其他参数如`horizon`、`obs_feature_dim`、`action_dim`等用于保存模型的内部状态
+
+- 设置推理步骤
+
+        if num_inference_steps is None:
+            num_inference_steps = noise_scheduler.config.num_train_timesteps
+        self.num_inference_steps = num_inference_steps
+
+  - 这段代码用于设置推理时的步骤数，如果未提供`num_inference_steps`，则默认为噪声调度器的训练时间步数
